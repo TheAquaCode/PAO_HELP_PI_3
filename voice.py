@@ -1,158 +1,172 @@
-"""
-voice.py — Atlas Voice Node (runs on Pi 3)
-
-Listens continuously for the wake word "hey atlas",
-then records speech, transcribes with Whisper,
-and sends the text to Pi 5.
-
-Usage:
-    python3 voice.py
-"""
-
 import sounddevice as sd
 import numpy as np
 import whisper
 import requests
 import tempfile
 import scipy.io.wavfile as wav
+import speech_recognition as sr
+import threading
 import time
-import os
+from flask import Flask, jsonify
 
-# --- Config ---
-PI5_URL = os.environ.get("ATLAS_PI5_URL", "http://pi5.local:5000/chat")
+# ── Config ──
+PI5_BASE   = "http://pi5.local:5000"
+PI5_VOICE  = f"{PI5_BASE}/voice"
+PI5_STATUS = f"{PI5_BASE}/pi3-status-feed"
+PI5_NOTIFY = f"{PI5_BASE}/notify"
 SAMPLE_RATE = 16000
-WAKE_WORD = "hey atlas"
-WAKE_LISTEN_SECONDS = 2      # short clip to check for wake word
-RECORD_SECONDS = 6           # how long to record after wake word
-SILENCE_THRESHOLD = 300       # amplitude below this = silence
-WHISPER_MODEL = os.environ.get("ATLAS_WHISPER_MODEL", "tiny")
+DURATION    = 10
+MODEL_SIZE  = "tiny"
 
-# --- Load Whisper model ---
-print("[*] Loading Whisper model...")
-model = whisper.load_model(WHISPER_MODEL)
-print(f"[✓] Whisper '{WHISPER_MODEL}' loaded. Listening for '{WAKE_WORD}'...\n")
+WAKE_WORDS = [
+    "atlas", "hey atlas", "hey at last", "hey at les",
+    "hey atl", "atlas help", "ok atlas", "okay atlas"
+]
 
+# ── Ping server ──
+ping_app = Flask(__name__)
 
-def record_audio(duration, sample_rate=SAMPLE_RATE):
-    """Record audio from the default microphone."""
+@ping_app.route("/ping")
+def ping():
+    return "ok", 200
+
+threading.Thread(
+    target=lambda: ping_app.run(host="0.0.0.0", port=5001, use_reloader=False),
+    daemon=True
+).start()
+
+# ── Send UI event to Pi 5 ──
+def notify(event_type, data=""):
     try:
-        audio = sd.rec(
-            int(duration * sample_rate),
-            samplerate=sample_rate,
-            channels=1,
-            dtype="int16"
-        )
-        sd.wait()
-        return audio, sample_rate
-    except Exception as e:
-        print(f"  [!] Microphone error: {e}")
-        return None, sample_rate
+        requests.post(PI5_NOTIFY, json={"type": event_type, "data": data}, timeout=2)
+    except:
+        pass
 
+# ── Pi 5 status polling for Windows SSH terminal ──
+def poll_pi5_status():
+    last = ""
+    while True:
+        try:
+            r = requests.get(PI5_STATUS, timeout=2)
+            if r.ok:
+                msg = r.json().get("status", "")
+                if msg and msg != last:
+                    print(f"[Pi 5] {msg}")
+                    last = msg
+        except:
+            pass
+        time.sleep(1)
+
+threading.Thread(target=poll_pi5_status, daemon=True).start()
+
+# ── Load Whisper ──
+print("Loading Whisper model...")
+model = whisper.load_model(MODEL_SIZE)
+print("Model loaded.")
+print("Say 'Atlas' to wake up.\n")
+
+def record_audio(duration=DURATION, sample_rate=SAMPLE_RATE):
+    audio = sd.rec(
+        int(duration * sample_rate),
+        samplerate=sample_rate,
+        channels=1,
+        dtype="int16"
+    )
+    for i in range(duration, 0, -1):
+        notify("countdown", i)
+        print(f"  {i}s remaining...")
+        time.sleep(1)
+    sd.wait()
+    print("Recording done.")
+    return audio, sample_rate
 
 def transcribe(audio, sample_rate):
-    """Save audio to a temp file and run Whisper on it."""
+    notify("transcribing", "")
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+        wav.write(f.name, sample_rate, audio)
+        print("Transcribing...")
+        result = model.transcribe(f.name)
+        text = result["text"].strip()
+        print(f"You said: {text}")
+        notify("heard", text)
+        return text
+
+def send_to_pi5(text):
     try:
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-            wav.write(f.name, sample_rate, audio)
-            result = model.transcribe(f.name)
-            text = result["text"].strip()
-            os.unlink(f.name)
-            return text
-    except Exception as e:
-        print(f"  [!] Transcription error: {e}")
-        return ""
-
-
-def has_speech(audio, threshold=SILENCE_THRESHOLD):
-    """Check if the audio clip contains any meaningful sound."""
-    return np.max(np.abs(audio)) > threshold
-
-
-def send_to_pi5(text, persona="assistant"):
-    """Send transcribed text to Pi 5 Flask endpoint."""
-    try:
-        print(f"  [>] Sending to Pi 5: '{text}'")
+        # Tell screen we are processing — Pi 5 will send done via ai_message
+        notify("processing", text)
+        print("Sending to Pi 5...")
         response = requests.post(
-            PI5_URL,
-            json={"message": text, "persona": persona},
-            timeout=60,
-            stream=True
+            PI5_VOICE,
+            json={"message": text},
+            timeout=180
         )
         if response.ok:
-            # Read the streamed response
-            full = ""
-            for line in response.iter_lines():
-                if line:
-                    decoded = line.decode("utf-8")
-                    if decoded.startswith("data: "):
-                        token = decoded[6:]
-                        if token == "[DONE]":
-                            break
-                        full += token
-            print(f"  [<] Atlas: {full}")
-            return full
+            reply = response.json().get("response", "")
+            print(f"Atlas: {reply}\n")
+            # Do NOT send done here — Pi 5 already pushed ai_message to the screen
+            return reply
         else:
-            print(f"  [!] Pi 5 returned status {response.status_code}")
+            print(f"Pi 5 error: {response.status_code}")
+            notify("error", f"Pi 5 error {response.status_code}")
+    except requests.exceptions.ReadTimeout:
+        print("Pi 5 took too long.")
+        notify("error", "Response timed out")
     except requests.exceptions.ConnectionError:
-        print("  [!] Cannot reach Pi 5 — is it running?")
-    except requests.exceptions.Timeout:
-        print("  [!] Pi 5 request timed out")
-    except Exception as e:
-        print(f"  [!] Network error: {e}")
-    return None
+        print("Could not reach Pi 5.")
+        notify("error", "Cannot reach Pi 5")
 
+def check_wake_word(text):
+    return any(w in text.lower() for w in WAKE_WORDS)
 
-# --- Main loop ---
-print("=" * 40)
-print(f"  Say '{WAKE_WORD}' to start talking")
-print("=" * 40)
+def listen_for_wake_word(recognizer, mic):
+    while True:
+        try:
+            with mic as source:
+                audio = recognizer.listen(source, timeout=5, phrase_time_limit=4)
+            text = recognizer.recognize_google(audio).lower()
+            print(f"[Heard]: {text}")
+            if check_wake_word(text):
+                print("\n✓ Wake word detected!")
+                notify("wake_detected", "")
+                return True
+        except sr.WaitTimeoutError:
+            pass
+        except sr.UnknownValueError:
+            pass
+        except sr.RequestError:
+            print("Google speech unavailable — falling back to Enter key.")
+            return False
+
+# ── Main ──
+recognizer = sr.Recognizer()
+mic = sr.Microphone(sample_rate=SAMPLE_RATE)
+
+print("Calibrating microphone...")
+with mic as source:
+    recognizer.adjust_for_ambient_noise(source, duration=2)
+print("Done. Listening for 'Atlas'...\n")
+
+notify("idle", "")
 
 while True:
     try:
-        # Step 1: Listen for wake word (short clips)
-        audio, rate = record_audio(WAKE_LISTEN_SECONDS)
-        if audio is None:
-            time.sleep(1)
-            continue
+        detected = listen_for_wake_word(recognizer, mic)
 
-        # Skip if silence
-        if not has_speech(audio):
-            continue
+        if not detected:
+            input("Press Enter to record (Ctrl+C to quit)...")
+            notify("wake_detected", "")
 
-        # Transcribe the short clip to check for wake word
-        text = transcribe(audio, rate).lower()
+        audio, rate = record_audio()
+        text = transcribe(audio, rate)
 
-        if WAKE_WORD not in text:
-            continue
+        if text:
+            send_to_pi5(text)
 
-        # Step 2: Wake word detected — record the actual question
-        print("\n[*] Wake word detected! Recording your question...")
-        audio, rate = record_audio(RECORD_SECONDS)
-        if audio is None:
-            continue
-
-        if not has_speech(audio):
-            print("  [!] No speech detected, going back to listening.")
-            continue
-
-        # Step 3: Transcribe the question
-        print("  [*] Transcribing...")
-        question = transcribe(audio, rate)
-
-        if not question:
-            print("  [!] Could not transcribe, going back to listening.")
-            continue
-
-        print(f"  [✓] You said: '{question}'")
-
-        # Step 4: Send to Pi 5
-        send_to_pi5(question)
-
-        print(f"\n[*] Listening for '{WAKE_WORD}'...\n")
+        notify("idle", "")
+        print("Listening for 'Atlas'...")
 
     except KeyboardInterrupt:
-        print("\n[*] Shutting down voice node.")
+        print("\nStopped.")
+        notify("idle", "")
         break
-    except Exception as e:
-        print(f"[!] Unexpected error: {e}")
-        time.sleep(2)
